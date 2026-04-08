@@ -124,6 +124,8 @@ type Server interface {
 	// If a connection with the given ID exists, it returns the corresponding webSocket instance.
 	// If no connection is found with the specified ID, it returns nil and a false flag.
 	GetChannel(websocketId string) (Channel, bool)
+	// AddHttpHandler adds a custom HTTP handler for a given path to the server's internal router.
+	AddHttpHandler(listenPath string, handler func(w http.ResponseWriter, r *http.Request))
 }
 
 // Default implementation of a Websocket server.
