@@ -269,41 +269,126 @@ func TestServerStartErrors(t *testing.T) {
 	wsServer.Stop()
 }
 
+// Last-wins duplicate policy (2026-07-28 sd ocpp-cs production lockout): a
+// charger that lost its previous connection re-dials, and the stale entry must
+// never lock it out. The NEW connection takes over; the OLD one is closed with
+// a PolicyViolation close frame.
 func TestClientDuplicateConnection(t *testing.T) {
-	wsServer := newWebsocketServer(t, nil)
+	newC := make(chan string, 10)
+	disconnC := make(chan string, 10)
+	wsServer := newWebsocketServer(t, func(data []byte) ([]byte, error) {
+		return data, nil // echo
+	})
 	wsServer.SetNewClientHandler(func(ws Channel) {
+		newC <- ws.ID()
+	})
+	wsServer.SetDisconnectedClientHandler(func(ws Channel) {
+		disconnC <- ws.ID()
 	})
 	// Start server
 	go wsServer.Start(serverPort, serverPath)
 	time.Sleep(100 * time.Millisecond)
 	// Connect client 1
+	oldClosedC := make(chan error, 1)
 	wsClient1 := newWebsocketClient(t, func(data []byte) ([]byte, error) {
 		return nil, nil
+	})
+	wsClient1.SetDisconnectedHandler(func(err error) {
+		wsClient1.SetDisconnectedHandler(nil)
+		oldClosedC <- err
 	})
 	host := fmt.Sprintf("localhost:%v", serverPort)
 	u := url.URL{Scheme: "ws", Host: host, Path: testPath}
 	err := wsClient1.Start(u.String())
 	require.NoError(t, err)
-	// Try to connect client 2
-	disconnectC := make(chan struct{})
+	require.Equal(t, "testws", <-newC)
+	// Connect client 2 with the same ID: it must WIN the slot.
+	echoC := make(chan []byte, 1)
 	wsClient2 := newWebsocketClient(t, func(data []byte) ([]byte, error) {
+		echoC <- data
 		return nil, nil
-	})
-	wsClient2.SetDisconnectedHandler(func(err error) {
-		require.IsType(t, &websocket.CloseError{}, err)
-		wsErr, _ := err.(*websocket.CloseError)
-		assert.Equal(t, websocket.ClosePolicyViolation, wsErr.Code)
-		assert.Equal(t, "a connection with this ID already exists", wsErr.Text)
-		wsClient2.SetDisconnectedHandler(nil)
-		disconnectC <- struct{}{}
 	})
 	err = wsClient2.Start(u.String())
 	require.NoError(t, err)
-	// Expect connection to be closed immediately
-	_, ok := <-disconnectC
-	assert.True(t, ok)
+
+	// The application layer sees disconnected(old) BEFORE the new client
+	// handler, preserving the disconnect → connect order.
+	select {
+	case id := <-disconnC:
+		assert.Equal(t, "testws", id)
+	case <-time.After(2 * time.Second):
+		t.Fatal("old connection was never reported as disconnected")
+	}
+	require.Equal(t, "testws", <-newC)
+
+	// The old client is closed with a PolicyViolation close frame.
+	select {
+	case err := <-oldClosedC:
+		if wsErr, ok := err.(*websocket.CloseError); ok {
+			assert.Equal(t, websocket.ClosePolicyViolation, wsErr.Code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("old connection was never closed")
+	}
+
+	// The new connection is fully functional (server echoes through it).
+	err = wsClient2.Write([]byte("hello"))
+	require.NoError(t, err)
+	select {
+	case data := <-echoC:
+		assert.Equal(t, []byte("hello"), data)
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never echoed through the new (winning) connection")
+	}
 	// Cleanup
-	wsClient1.Stop()
+	wsClient2.Stop()
+	wsServer.Stop()
+}
+
+// A reconnect storm with the same ID (StarCharge firmware re-dials every 3.6s
+// during the 2026-07-28 lockout) must neither panic, deadlock, nor lock the
+// charger out: after the storm the latest connection is functional.
+func TestClientDuplicateConnectionStorm(t *testing.T) {
+	wsServer := newWebsocketServer(t, func(data []byte) ([]byte, error) {
+		return data, nil // echo
+	})
+	wsServer.SetNewClientHandler(func(ws Channel) {})
+	wsServer.SetDisconnectedClientHandler(func(ws Channel) {})
+	go wsServer.Start(serverPort, serverPath)
+	time.Sleep(100 * time.Millisecond)
+
+	host := fmt.Sprintf("localhost:%v", serverPort)
+	u := url.URL{Scheme: "ws", Host: host, Path: testPath}
+
+	const storms = 30
+	clients := make([]*Client, 0, storms)
+	for i := 0; i < storms; i++ {
+		c := newWebsocketClient(t, func(data []byte) ([]byte, error) { return nil, nil })
+		if err := c.Start(u.String()); err == nil {
+			clients = append(clients, c)
+		}
+	}
+	require.NotEmpty(t, clients)
+
+	// The LAST successfully connected client must win and be functional.
+	echoC := make(chan []byte, 1)
+	last := newWebsocketClient(t, func(data []byte) ([]byte, error) {
+		echoC <- data
+		return nil, nil
+	})
+	require.NoError(t, last.Start(u.String()))
+	require.NoError(t, last.Write([]byte("survivor")))
+	select {
+	case data := <-echoC:
+		assert.Equal(t, []byte("survivor"), data)
+	case <-time.After(2 * time.Second):
+		t.Fatal("charger locked out after reconnect storm (incident 2026-07-28 regression)")
+	}
+
+	last.Stop()
+	for _, c := range clients {
+		c.Stop()
+	}
 	wsServer.Stop()
 }
 
