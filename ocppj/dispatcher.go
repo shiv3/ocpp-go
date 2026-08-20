@@ -88,6 +88,7 @@ type pendingRequest struct {
 type DefaultClientDispatcher struct {
 	requestQueue        RequestQueue
 	requestChannel      chan bool
+	stopped             bool
 	readyForDispatch    chan bool
 	pendingRequestState ClientState
 	network             ws.WsClient
@@ -121,7 +122,10 @@ func (d *DefaultClientDispatcher) SetTimeout(timeout time.Duration) {
 }
 
 func (d *DefaultClientDispatcher) Start() {
+	d.mutex.Lock()
 	d.requestChannel = make(chan bool, 1)
+	d.stopped = false
+	d.mutex.Unlock()
 	d.timer = time.NewTimer(defaultTimeoutTick) // Default to 24 hours tick
 	go d.messagePump()
 }
@@ -141,7 +145,13 @@ func (d *DefaultClientDispatcher) IsPaused() bool {
 func (d *DefaultClientDispatcher) Stop() {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
+	if d.requestChannel == nil {
+		return
+	}
 	close(d.requestChannel)
+	// The channel stays non-nil until the pump notices the close, so IsRunning
+	// keeps answering true for that window; sends are guarded by stopped instead.
+	d.stopped = true
 	// TODO: clear pending requests?
 }
 
@@ -153,14 +163,32 @@ func (d *DefaultClientDispatcher) SetPendingRequestState(state ClientState) {
 	d.pendingRequestState = state
 }
 
+// SendRequest queues a request for delivery.
+//
+// A disconnect can stop the dispatcher while a caller — a heartbeat loop, a
+// meter-value sender — is right here, and sending on the closed channel would
+// take the process down. The stopped flag is checked under the same lock Stop
+// holds, so such a caller gets an error back instead.
 func (d *DefaultClientDispatcher) SendRequest(req RequestBundle) error {
 	if d.network == nil {
 		return fmt.Errorf("cannot SendRequest, no network client was set")
 	}
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	if d.stopped || d.requestChannel == nil {
+		return fmt.Errorf("cannot SendRequest, dispatcher is stopped")
+	}
 	if err := d.requestQueue.Push(req); err != nil {
 		return err
 	}
-	d.requestChannel <- true
+	// Non-blocking wake: the pump checks the queue on every wake, so when the
+	// buffer already holds a signal this push is covered by it. Blocking here
+	// while holding the lock would deadlock against the pump, which takes the
+	// same lock in IsPaused.
+	select {
+	case d.requestChannel <- true:
+	default:
+	}
 	return nil
 }
 

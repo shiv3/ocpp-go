@@ -3,6 +3,7 @@ package ocppj_test
 import (
 	"fmt"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -771,4 +772,36 @@ func (c *ClientDispatcherTestSuite) TestClientSendPausedDispatcher() {
 	time.Sleep(1 * time.Second)
 	assert.Equal(t, requestNumber, c.queue.Size())
 	assert.False(t, c.state.HasPendingRequest())
+}
+
+// A charge point's Stop can race a heartbeat that is just being sent — every
+// disconnect on a live charger does this. The send must fail with an error, not
+// bring the process down on the closed request channel.
+func TestClientDispatcherSendRequestDuringStopDoesNotPanic(t *testing.T) {
+	for round := 0; round < 200; round++ {
+		queue := ocppj.NewFIFOClientQueue(10)
+		dispatcher := ocppj.NewDefaultClientDispatcher(queue)
+		dispatcher.SetPendingRequestState(ocppj.NewClientState())
+		endpoint := ocppj.Client{}
+		endpoint.AddProfile(ocpp.NewProfile("mock", &MockFeature{}))
+		websocketClient := MockWebsocketClient{}
+		websocketClient.On("Write", mock.Anything).Return(nil)
+		dispatcher.SetNetworkClient(&websocketClient)
+		dispatcher.Start()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for i := 0; i < 20; i++ {
+				call, err := endpoint.CreateCall(newMockRequest("somevalue"))
+				require.NoError(t, err)
+				data, err := call.MarshalJSON()
+				require.NoError(t, err)
+				// The error is expected once the dispatcher stops; the panic is not.
+				_ = dispatcher.SendRequest(ocppj.RequestBundle{Call: call, Data: data})
+			}
+		}()
+		dispatcher.Stop()
+		<-done
+	}
 }
