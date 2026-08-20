@@ -17,6 +17,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1283,4 +1284,60 @@ func createTLSCertificate(certificateFilename string, keyFilename string, cn str
 		return err
 	}
 	return nil
+}
+
+// A charge point that keeps sending while its connection is being torn down —
+// a heartbeat racing a dropped link, which is every reconnect on a flaky
+// network — must get an error back. Sending on the closed queue instead takes
+// the whole process down, and in a load test that is every simulated charger at
+// once (sd herd run, 2026-08-20).
+func TestClientWriteDuringDisconnectDoesNotPanic(t *testing.T) {
+	for round := 0; round < 8; round++ {
+		// No echo: the point here is the client's send path, and answering a
+		// socket that is being torn down would just fail on the server side.
+		wsServer := newWebsocketServer(t, func(data []byte) ([]byte, error) { return nil, nil })
+		wsServer.SetNewClientHandler(func(ws Channel) {})
+		wsServer.SetDisconnectedClientHandler(func(ws Channel) {})
+		go wsServer.Start(serverPort, serverPath)
+		time.Sleep(100 * time.Millisecond)
+		u := url.URL{Scheme: "ws", Host: fmt.Sprintf("localhost:%v", serverPort), Path: testPath}
+
+		clients := make([]*Client, 0, 8)
+		for i := 0; i < 8; i++ {
+			c := newWebsocketClient(t, nil)
+			c.SetReconnectedHandler(func() {})
+			if err := c.Start(u.String()); err == nil {
+				clients = append(clients, c)
+			}
+		}
+		require.NotEmpty(t, clients)
+
+		var writers sync.WaitGroup
+		stop := make(chan struct{})
+		for _, c := range clients {
+			c := c
+			writers.Add(1)
+			go func() {
+				defer writers.Done()
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					// The error is expected once the socket is gone; the panic is not.
+					_ = c.Write([]byte("hello"))
+				}
+			}()
+		}
+		// The server drops everyone, which is what the client's cleanup races with.
+		time.Sleep(20 * time.Millisecond)
+		wsServer.Stop()
+		time.Sleep(50 * time.Millisecond)
+		close(stop)
+		writers.Wait()
+		for _, c := range clients {
+			c.Stop()
+		}
+	}
 }

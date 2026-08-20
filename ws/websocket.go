@@ -1035,10 +1035,16 @@ func (client *Client) readPump() {
 // From this moment onwards, no new messages may be sent.
 func (client *Client) cleanup() {
 	client.setConnected(false)
-	ws := client.webSocket
+	ws := &client.webSocket
 	_ = ws.connection.Close()
 	client.mutex.Lock()
 	defer client.mutex.Unlock()
+	ws.sendMutex.Lock()
+	defer ws.sendMutex.Unlock()
+	if ws.closed {
+		return
+	}
+	ws.closed = true
 	close(ws.outQueue)
 	close(ws.closeC)
 }
@@ -1084,13 +1090,36 @@ func (client *Client) IsConnected() bool {
 	return client.connected
 }
 
+// Write queues data for the server.
+//
+// The connection can go away between the connected check and the send — a
+// server-side disconnect while a heartbeat is on its way out is an ordinary
+// event on a mobile link — so the send is guarded the same way the server side
+// is: a caller that loses the race gets an error instead of taking the process
+// down on a closed channel.
 func (client *Client) Write(data []byte) error {
 	if !client.IsConnected() {
 		return fmt.Errorf("client is currently not connected, cannot send data")
 	}
+	// Pointer: WebSocket is a value field, and the guard has to act on the
+	// client's own socket rather than on a copy of it.
+	ws := &client.webSocket
+	ws.sendMutex.Lock()
+	defer ws.sendMutex.Unlock()
+	if ws.closed {
+		return fmt.Errorf("client is currently not connected, cannot send data")
+	}
 	log.Debugf("queuing data for server")
-	client.webSocket.outQueue <- data
-	return nil
+	// Non-blocking, like the server side: blocking here would hold the guard while
+	// the writePump is gone, and cleanup would then wait on it forever. A full
+	// queue means this connection is stalled, which the caller handles as a write
+	// failure.
+	select {
+	case ws.outQueue <- data:
+		return nil
+	default:
+		return fmt.Errorf("couldn't write to websocket. Send queue is full")
+	}
 }
 
 func (client *Client) Start(urlStr string) error {
@@ -1129,9 +1158,11 @@ func (client *Client) Start(urlStr string) error {
 	id := path.Base(url.Path)
 	client.url = *url
 	client.webSocket = WebSocket{
-		connection:         ws,
-		id:                 id,
-		outQueue:           make(chan []byte, 1),
+		connection: ws,
+		id:         id,
+		// Room to absorb a burst while the writePump drains; the send itself is
+		// non-blocking, so this is the buffer the caller writes into.
+		outQueue:           make(chan []byte, 32),
 		closeC:             make(chan websocket.CloseError, 1),
 		forceCloseC:        make(chan error, 1),
 		tlsConnectionState: resp.TLS,
