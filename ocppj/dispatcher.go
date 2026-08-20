@@ -503,14 +503,23 @@ func (d *DefaultServerDispatcher) messagePump() {
 				clientContextMap[clientID] = clientTimeoutContext{}
 			}
 			if d.pendingRequestState.HasPendingRequest(clientID) {
-				// Current request for client timed out. Removing request and triggering cancel callback
-				q, _ := d.queueMap.Get(clientID)
-				bundle, _ := q.Peek().(RequestBundle)
-				d.CompleteRequest(clientID, bundle.Call.UniqueId)
-				log.Infof("request %v for %v timed out", bundle.Call.UniqueId, clientID)
-				if d.onRequestCancel != nil {
-					d.onRequestCancel(clientID, bundle.Call.UniqueId, bundle.Call.Payload,
-						ocpp.NewError(GenericError, "Request timed out", bundle.Call.UniqueId))
+				// Current request for client timed out. Removing request and triggering cancel callback.
+				// The queue may hold nothing to cancel: an answer for the very same request
+				// can be completing it right now, having already taken it off the queue.
+				q, ok := d.queueMap.Get(clientID)
+				var bundle RequestBundle
+				if ok {
+					bundle, ok = q.Peek().(RequestBundle)
+				}
+				if ok {
+					d.CompleteRequest(clientID, bundle.Call.UniqueId)
+					log.Infof("request %v for %v timed out", bundle.Call.UniqueId, clientID)
+					if d.onRequestCancel != nil {
+						d.onRequestCancel(clientID, bundle.Call.UniqueId, bundle.Call.Payload,
+							ocpp.NewError(GenericError, "Request timed out", bundle.Call.UniqueId))
+					}
+				} else {
+					log.Infof("timeout for %v, but no request left to cancel", clientID)
 				}
 			}
 		case clientID = <-d.readyForDispatch:

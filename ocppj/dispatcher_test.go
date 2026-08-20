@@ -330,6 +330,134 @@ func (s *ServerDispatcherTestSuite) TestServerDispatcherStaysAliveOnTimeoutDurin
 	}
 }
 
+// A charge point that drops off the network while a request is in flight has its queue
+// removed, but the pending request outlives it and still times out. Handling that
+// timeout must not reach into the queue that is no longer there: the dispatcher runs a
+// whole fleet, so a panic here takes every other charge point down with it.
+func (s *ServerDispatcherTestSuite) TestServerDispatcherTimeoutAfterClientDeleted() {
+	t := s.T()
+	const (
+		goneID  = "gone"
+		aliveID = "alive"
+		timeout = 200 * time.Millisecond
+	)
+	dispatched := map[string]chan struct{}{
+		goneID:  make(chan struct{}, 1),
+		aliveID: make(chan struct{}, 1),
+	}
+	s.websocketServer.On("Write", mock.AnythingOfType("string"), mock.Anything).Run(func(args mock.Arguments) {
+		id, _ := args.Get(0).(string)
+		if ch, ok := dispatched[id]; ok {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+	}).Return(nil)
+	s.dispatcher.SetTimeout(timeout)
+	s.dispatcher.Start()
+	defer func() { go s.dispatcher.Stop() }()
+	newBundle := func() ocppj.RequestBundle {
+		call, err := s.endpoint.CreateCall(newMockRequest("somevalue"))
+		require.NoError(t, err)
+		data, err := call.MarshalJSON()
+		require.NoError(t, err)
+		return ocppj.RequestBundle{Call: call, Data: data}
+	}
+	// Send a request, then drop the client before the answer (or the timeout) arrives.
+	s.dispatcher.CreateClient(goneID)
+	require.NoError(t, s.dispatcher.SendRequest(goneID, newBundle()))
+	<-dispatched[goneID]
+	s.dispatcher.DeleteClient(goneID)
+	require.True(t, s.state.HasPendingRequest(goneID))
+	// Another charge point must be served normally while that timeout elapses.
+	time.Sleep(2 * timeout)
+	s.dispatcher.CreateClient(aliveID)
+	go func() { _ = s.dispatcher.SendRequest(aliveID, newBundle()) }()
+	select {
+	case <-dispatched[aliveID]:
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "dispatcher stopped serving other clients")
+	}
+}
+
+// slowDeleteState holds a request in the pending state after its queue entry is gone,
+// which is the window CompleteRequest passes through on every answered request.
+type slowDeleteState struct {
+	ocppj.ServerState
+	deleting chan struct{}
+	release  chan struct{}
+}
+
+func (st *slowDeleteState) DeletePendingRequest(clientID string, requestID string) {
+	select {
+	case st.deleting <- struct{}{}:
+		<-st.release
+	default:
+	}
+	st.ServerState.DeletePendingRequest(clientID, requestID)
+}
+
+// An answer and a timeout can reach the dispatcher for the same request at the same
+// time: the answer empties the queue while the timeout still sees a pending request.
+// The timeout must cope with the empty queue instead of taking the whole fleet down.
+func (s *ServerDispatcherTestSuite) TestServerDispatcherTimeoutRacingWithResponse() {
+	t := s.T()
+	const (
+		clientID = "client1"
+		aliveID  = "alive"
+		timeout  = 200 * time.Millisecond
+	)
+	state := &slowDeleteState{
+		ServerState: ocppj.NewServerState(&s.mutex),
+		deleting:    make(chan struct{}, 1),
+		release:     make(chan struct{}),
+	}
+	s.dispatcher.SetPendingRequestState(state)
+	dispatched := map[string]chan struct{}{
+		clientID: make(chan struct{}, 1),
+		aliveID:  make(chan struct{}, 1),
+	}
+	s.websocketServer.On("Write", mock.AnythingOfType("string"), mock.Anything).Run(func(args mock.Arguments) {
+		id, _ := args.Get(0).(string)
+		if ch, ok := dispatched[id]; ok {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+	}).Return(nil)
+	s.dispatcher.SetTimeout(timeout)
+	s.dispatcher.Start()
+	defer func() { go s.dispatcher.Stop() }()
+	newBundle := func() (ocppj.RequestBundle, string) {
+		call, err := s.endpoint.CreateCall(newMockRequest("somevalue"))
+		require.NoError(t, err)
+		data, err := call.MarshalJSON()
+		require.NoError(t, err)
+		return ocppj.RequestBundle{Call: call, Data: data}, call.UniqueId
+	}
+	s.dispatcher.CreateClient(clientID)
+	bundle, requestID := newBundle()
+	require.NoError(t, s.dispatcher.SendRequest(clientID, bundle))
+	<-dispatched[clientID]
+	// The answer arrives and empties the queue, but stalls before clearing the pending
+	// request, so the timeout below lands in the middle of that window.
+	go s.dispatcher.CompleteRequest(clientID, requestID)
+	<-state.deleting
+	time.Sleep(2 * timeout)
+	close(state.release)
+	// Another charge point must still be served.
+	s.dispatcher.CreateClient(aliveID)
+	aliveBundle, _ := newBundle()
+	go func() { _ = s.dispatcher.SendRequest(aliveID, aliveBundle) }()
+	select {
+	case <-dispatched[aliveID]:
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "dispatcher stopped serving other clients")
+	}
+}
+
 type ClientDispatcherTestSuite struct {
 	suite.Suite
 	state           ocppj.ClientState
