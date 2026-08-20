@@ -617,5 +617,26 @@ func (d *DefaultServerDispatcher) CompleteRequest(clientID string, requestID str
 	d.pendingRequestState.DeletePendingRequest(clientID, requestID)
 	log.Debugf("completed request %s for %s", callID, clientID)
 	// Signal that next message in queue may be sent
-	d.readyForDispatch <- clientID
+	d.signalReadyForDispatch(clientID)
+}
+
+// signalReadyForDispatch tells messagePump that clientID may transmit again.
+//
+// messagePump calls CompleteRequest itself while handling a request timeout or a write
+// error, and it is the only reader of readyForDispatch, so a blocking send here wedges
+// the pump against its own signal and stops every client on the server. The send must
+// therefore never block the caller; when the buffer is busy, a sender goroutine waits
+// on the pump's behalf instead.
+func (d *DefaultServerDispatcher) signalReadyForDispatch(clientID string) {
+	select {
+	case d.readyForDispatch <- clientID:
+	default:
+		stoppedC := d.stoppedC
+		go func() {
+			select {
+			case d.readyForDispatch <- clientID:
+			case <-stoppedC:
+			}
+		}()
+	}
 }

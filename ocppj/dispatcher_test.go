@@ -231,6 +231,105 @@ func (s *ServerDispatcherTestSuite) TestServerDispatcherTimeout() {
 	assert.True(t, clientQ.IsEmpty())
 }
 
+// A request timeout makes messagePump call CompleteRequest from inside its own loop,
+// and CompleteRequest signals readyForDispatch, a channel only messagePump reads.
+// While concurrent responses keep that channel occupied, the pump must not block on
+// its own signal: doing so stops every OCPP message on the server (prod, 2026-08-18).
+func (s *ServerDispatcherTestSuite) TestServerDispatcherStaysAliveOnTimeoutDuringResponseStorm() {
+	t := s.T()
+	const (
+		silentClients     = 8
+		requestsPerSilent = 8
+		stormClients      = 8
+		timeout           = 200 * time.Millisecond
+		stormDuration     = 2 * time.Second
+	)
+	// Queues must hold every preloaded request of a silent client.
+	s.queueMap = ocppj.NewFIFOQueueMap(requestsPerSilent)
+	s.dispatcher = ocppj.NewDefaultServerDispatcher(s.queueMap)
+	s.dispatcher.SetPendingRequestState(s.state)
+	s.dispatcher.SetNetworkServer(&s.websocketServer)
+	s.dispatcher.SetTimeout(timeout)
+	// Storm clients only answer requests that were actually put on the wire, as a real
+	// charge point does. The channels are all created before the dispatcher starts.
+	const canaryID = "canary"
+	dispatched := map[string]chan struct{}{canaryID: make(chan struct{}, 1)}
+	for i := 0; i < stormClients; i++ {
+		dispatched[fmt.Sprintf("storm%d", i)] = make(chan struct{}, 1)
+	}
+	s.websocketServer.On("Write", mock.AnythingOfType("string"), mock.Anything).Run(func(args mock.Arguments) {
+		id, _ := args.Get(0).(string)
+		if ch, ok := dispatched[id]; ok {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+	}).Return(nil)
+	canaryCanceled := make(chan struct{}, 1)
+	s.dispatcher.SetOnRequestCanceled(func(cID string, rID string, request ocpp.Request, err *ocpp.Error) {
+		if cID == canaryID {
+			select {
+			case canaryCanceled <- struct{}{}:
+			default:
+			}
+		}
+	})
+	s.dispatcher.Start()
+	// Stop() needs the dispatcher's lock, which a wedged dispatcher never releases, so
+	// cleanup runs in the background and never holds up the assertions below.
+	defer func() { go s.dispatcher.Stop() }()
+	newBundle := func() (ocppj.RequestBundle, string) {
+		call, err := s.endpoint.CreateCall(newMockRequest("somevalue"))
+		require.NoError(t, err)
+		data, err := call.MarshalJSON()
+		require.NoError(t, err)
+		return ocppj.RequestBundle{Call: call, Data: data}, call.UniqueId
+	}
+	// Silent clients never answer, so each dispatched request times out and the next
+	// one is dispatched right after — a steady supply of in-pump CompleteRequest calls.
+	for i := 0; i < silentClients; i++ {
+		clientID := fmt.Sprintf("silent%d", i)
+		s.dispatcher.CreateClient(clientID)
+		for j := 0; j < requestsPerSilent; j++ {
+			bundle, _ := newBundle()
+			require.NoError(t, s.dispatcher.SendRequest(clientID, bundle))
+		}
+	}
+	// Storm clients answer immediately, keeping readyForDispatch occupied. They run in
+	// their own goroutines and are left behind if the dispatcher stops making progress.
+	for i := 0; i < stormClients; i++ {
+		clientID := fmt.Sprintf("storm%d", i)
+		s.dispatcher.CreateClient(clientID)
+		go func() {
+			deadline := time.Now().Add(stormDuration)
+			for time.Now().Before(deadline) {
+				bundle, requestID := newBundle()
+				if err := s.dispatcher.SendRequest(clientID, bundle); err != nil {
+					return
+				}
+				<-dispatched[clientID]
+				s.dispatcher.CompleteRequest(clientID, requestID)
+			}
+		}()
+	}
+	time.Sleep(stormDuration)
+	// A request arriving after the storm must still reach the wire and still time out.
+	s.dispatcher.CreateClient(canaryID)
+	canaryBundle, _ := newBundle()
+	go func() { _ = s.dispatcher.SendRequest(canaryID, canaryBundle) }()
+	select {
+	case <-dispatched[canaryID]:
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "dispatcher stopped dispatching requests")
+	}
+	select {
+	case <-canaryCanceled:
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "dispatcher stopped timing out requests")
+	}
+}
+
 type ClientDispatcherTestSuite struct {
 	suite.Suite
 	state           ocppj.ClientState
