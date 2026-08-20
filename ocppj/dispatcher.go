@@ -350,6 +350,7 @@ type ServerDispatcher interface {
 type DefaultServerDispatcher struct {
 	queueMap            ServerQueueMap
 	requestChannel      chan string
+	deletedChannel      chan string
 	readyForDispatch    chan string
 	pendingRequestState ServerState
 	timeout             time.Duration
@@ -388,6 +389,7 @@ func NewDefaultServerDispatcher(queueMap ServerQueueMap) *DefaultServerDispatche
 
 func (d *DefaultServerDispatcher) Start() {
 	d.requestChannel = make(chan string, 20)
+	d.deletedChannel = make(chan string, 20)
 	d.timerC = make(chan string, 10)
 	d.stoppedC = make(chan struct{}, 1)
 	d.running = true
@@ -420,7 +422,10 @@ func (d *DefaultServerDispatcher) CreateClient(clientID string) {
 func (d *DefaultServerDispatcher) DeleteClient(clientID string) {
 	d.queueMap.Remove(clientID)
 	if d.IsRunning() {
-		d.requestChannel <- clientID
+		// Announced on its own channel: by the time the pump gets here the same client
+		// ID may have been created again by a reconnecting charge point, and a deletion
+		// is then indistinguishable from a new request on the shared request channel.
+		d.deletedChannel <- clientID
 	}
 }
 
@@ -490,6 +495,17 @@ func (d *DefaultServerDispatcher) messagePump() {
 				// If there is no active context, the client is ready to transmit
 				rdy = !clientCtx.isActive()
 			}
+		case clientID = <-d.deletedChannel:
+			// The connection this client ID belonged to is gone. Drop its timeout so a
+			// charge point that has already re-dialed under the same ID can transmit
+			// straight away instead of waiting out the departed connection's timer.
+			clientCtx = clientContextMap[clientID]
+			delete(clientContextMap, clientID)
+			if clientCtx.isActive() {
+				clientCtx.cancel()
+			}
+			clientQueue, ok = d.queueMap.Get(clientID)
+			rdy = ok
 		case clientID, ok = <-d.timerC:
 			// Timeout elapsed
 			if !ok {

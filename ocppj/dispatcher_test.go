@@ -24,6 +24,22 @@ type ServerDispatcherTestSuite struct {
 	queueMap        ocppj.ServerQueueMap
 }
 
+// stopDispatcher shuts the pump down and waits for it, so a dispatcher left over from
+// one test cannot write to the mock the next test has already replaced. The wait is
+// bounded: a wedged dispatcher never stops, and the test that wedged it has failed by
+// the time this runs.
+func stopDispatcher(d ocppj.ServerDispatcher) {
+	stopped := make(chan struct{})
+	go func() {
+		d.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+	}
+}
+
 func (s *ServerDispatcherTestSuite) SetupTest() {
 	s.endpoint = ocppj.Server{}
 	mockProfile := ocpp.NewProfile("mock", &MockFeature{})
@@ -257,7 +273,9 @@ func (s *ServerDispatcherTestSuite) TestServerDispatcherStaysAliveOnTimeoutDurin
 	for i := 0; i < stormClients; i++ {
 		dispatched[fmt.Sprintf("storm%d", i)] = make(chan struct{}, 1)
 	}
-	s.websocketServer.On("Write", mock.AnythingOfType("string"), mock.Anything).Run(func(args mock.Arguments) {
+	networkServer := &MockWebsocketServer{}
+	s.dispatcher.SetNetworkServer(networkServer)
+	networkServer.On("Write", mock.AnythingOfType("string"), mock.Anything).Run(func(args mock.Arguments) {
 		id, _ := args.Get(0).(string)
 		if ch, ok := dispatched[id]; ok {
 			select {
@@ -278,7 +296,7 @@ func (s *ServerDispatcherTestSuite) TestServerDispatcherStaysAliveOnTimeoutDurin
 	s.dispatcher.Start()
 	// Stop() needs the dispatcher's lock, which a wedged dispatcher never releases, so
 	// cleanup runs in the background and never holds up the assertions below.
-	defer func() { go s.dispatcher.Stop() }()
+	defer stopDispatcher(s.dispatcher)
 	newBundle := func() (ocppj.RequestBundle, string) {
 		call, err := s.endpoint.CreateCall(newMockRequest("somevalue"))
 		require.NoError(t, err)
@@ -298,10 +316,13 @@ func (s *ServerDispatcherTestSuite) TestServerDispatcherStaysAliveOnTimeoutDurin
 	}
 	// Storm clients answer immediately, keeping readyForDispatch occupied. They run in
 	// their own goroutines and are left behind if the dispatcher stops making progress.
+	var storm sync.WaitGroup
 	for i := 0; i < stormClients; i++ {
 		clientID := fmt.Sprintf("storm%d", i)
 		s.dispatcher.CreateClient(clientID)
+		storm.Add(1)
 		go func() {
+			defer storm.Done()
 			deadline := time.Now().Add(stormDuration)
 			for time.Now().Before(deadline) {
 				bundle, requestID := newBundle()
@@ -328,6 +349,13 @@ func (s *ServerDispatcherTestSuite) TestServerDispatcherStaysAliveOnTimeoutDurin
 	case <-time.After(2 * time.Second):
 		require.Fail(t, "dispatcher stopped timing out requests")
 	}
+	// Let the storm goroutines retire before the suite hands the mock to the next test.
+	stormDone := make(chan struct{})
+	go func() { storm.Wait(); close(stormDone) }()
+	select {
+	case <-stormDone:
+	case <-time.After(2 * time.Second):
+	}
 }
 
 // A charge point that drops off the network while a request is in flight has its queue
@@ -345,7 +373,9 @@ func (s *ServerDispatcherTestSuite) TestServerDispatcherTimeoutAfterClientDelete
 		goneID:  make(chan struct{}, 1),
 		aliveID: make(chan struct{}, 1),
 	}
-	s.websocketServer.On("Write", mock.AnythingOfType("string"), mock.Anything).Run(func(args mock.Arguments) {
+	networkServer := &MockWebsocketServer{}
+	s.dispatcher.SetNetworkServer(networkServer)
+	networkServer.On("Write", mock.AnythingOfType("string"), mock.Anything).Run(func(args mock.Arguments) {
 		id, _ := args.Get(0).(string)
 		if ch, ok := dispatched[id]; ok {
 			select {
@@ -356,7 +386,7 @@ func (s *ServerDispatcherTestSuite) TestServerDispatcherTimeoutAfterClientDelete
 	}).Return(nil)
 	s.dispatcher.SetTimeout(timeout)
 	s.dispatcher.Start()
-	defer func() { go s.dispatcher.Stop() }()
+	defer stopDispatcher(s.dispatcher)
 	newBundle := func() ocppj.RequestBundle {
 		call, err := s.endpoint.CreateCall(newMockRequest("somevalue"))
 		require.NoError(t, err)
@@ -378,6 +408,62 @@ func (s *ServerDispatcherTestSuite) TestServerDispatcherTimeoutAfterClientDelete
 	case <-dispatched[aliveID]:
 	case <-time.After(2 * time.Second):
 		require.Fail(t, "dispatcher stopped serving other clients")
+	}
+}
+
+// A charge point that re-dials takes over its own client ID: the server tears the old
+// client down and sets the new one up right away, while the pump may still be busy
+// elsewhere. The request the new connection sends must go out on its own account, not
+// wait for a timer that belongs to the connection that is already gone.
+func (s *ServerDispatcherTestSuite) TestServerDispatcherRequestAfterClientTakeover() {
+	t := s.T()
+	const (
+		clientID  = "cp"
+		blockerID = "blocker"
+		timeout   = 3 * time.Second
+	)
+	writing := make(chan struct{}, 1)
+	releaseWrite := make(chan struct{})
+	dispatched := make(chan struct{}, 4)
+	networkServer := &MockWebsocketServer{}
+	s.dispatcher.SetNetworkServer(networkServer)
+	networkServer.On("Write", mock.AnythingOfType("string"), mock.Anything).Run(func(args mock.Arguments) {
+		if id, _ := args.Get(0).(string); id == blockerID {
+			writing <- struct{}{}
+			<-releaseWrite
+			return
+		}
+		dispatched <- struct{}{}
+	}).Return(nil)
+	s.dispatcher.SetTimeout(timeout)
+	s.dispatcher.Start()
+	defer stopDispatcher(s.dispatcher)
+	newBundle := func() ocppj.RequestBundle {
+		call, err := s.endpoint.CreateCall(newMockRequest("somevalue"))
+		require.NoError(t, err)
+		data, err := call.MarshalJSON()
+		require.NoError(t, err)
+		return ocppj.RequestBundle{Call: call, Data: data}
+	}
+	// The old connection has a request in flight, so a timeout is armed for this ID.
+	s.dispatcher.CreateClient(clientID)
+	require.NoError(t, s.dispatcher.SendRequest(clientID, newBundle()))
+	<-dispatched
+	// Keep the pump busy so the whole takeover lands in one go, as it does when a
+	// reconnect storm keeps the dispatcher occupied.
+	s.dispatcher.CreateClient(blockerID)
+	require.NoError(t, s.dispatcher.SendRequest(blockerID, newBundle()))
+	<-writing
+	// Takeover, in the order ocppj's server performs it: disconnect, then connect.
+	s.dispatcher.DeleteClient(clientID)
+	s.state.ClearClientPendingRequest(clientID)
+	s.dispatcher.CreateClient(clientID)
+	require.NoError(t, s.dispatcher.SendRequest(clientID, newBundle()))
+	close(releaseWrite)
+	select {
+	case <-dispatched:
+	case <-time.After(timeout / 2):
+		require.Fail(t, "request from the new connection was not dispatched")
 	}
 }
 
@@ -418,7 +504,9 @@ func (s *ServerDispatcherTestSuite) TestServerDispatcherTimeoutRacingWithRespons
 		clientID: make(chan struct{}, 1),
 		aliveID:  make(chan struct{}, 1),
 	}
-	s.websocketServer.On("Write", mock.AnythingOfType("string"), mock.Anything).Run(func(args mock.Arguments) {
+	networkServer := &MockWebsocketServer{}
+	s.dispatcher.SetNetworkServer(networkServer)
+	networkServer.On("Write", mock.AnythingOfType("string"), mock.Anything).Run(func(args mock.Arguments) {
 		id, _ := args.Get(0).(string)
 		if ch, ok := dispatched[id]; ok {
 			select {
@@ -429,7 +517,7 @@ func (s *ServerDispatcherTestSuite) TestServerDispatcherTimeoutRacingWithRespons
 	}).Return(nil)
 	s.dispatcher.SetTimeout(timeout)
 	s.dispatcher.Start()
-	defer func() { go s.dispatcher.Stop() }()
+	defer stopDispatcher(s.dispatcher)
 	newBundle := func() (ocppj.RequestBundle, string) {
 		call, err := s.endpoint.CreateCall(newMockRequest("somevalue"))
 		require.NoError(t, err)
