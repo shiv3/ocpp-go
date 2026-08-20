@@ -270,7 +270,7 @@ func TestServerStartErrors(t *testing.T) {
 	wsServer.Stop()
 }
 
-// Last-wins duplicate policy (2026-07-28 sd ocpp-cs production lockout): a
+// Last-wins duplicate policy (2026-07-28 production lockout): a
 // charger that lost its previous connection re-dials, and the stale entry must
 // never lock it out. The NEW connection takes over; the OLD one is closed with
 // a PolicyViolation close frame.
@@ -1290,7 +1290,7 @@ func createTLSCertificate(certificateFilename string, keyFilename string, cn str
 // a heartbeat racing a dropped link, which is every reconnect on a flaky
 // network — must get an error back. Sending on the closed queue instead takes
 // the whole process down, and in a load test that is every simulated charger at
-// once (sd herd run, 2026-08-20).
+// once (fleet reconnect load test, 2026-08-20).
 func TestClientWriteDuringDisconnectDoesNotPanic(t *testing.T) {
 	for round := 0; round < 8; round++ {
 		// No echo: the point here is the client's send path, and answering a

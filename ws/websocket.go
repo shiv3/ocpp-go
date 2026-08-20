@@ -465,7 +465,7 @@ func (server *Server) stopConnections() {
 // Write queues data for the given connection without ever blocking the whole
 // server: the previous implementation held the global connMutex while doing a
 // blocking send on a 1-slot channel, so a single stalled connection could
-// freeze every other connection (sd incident 2026-07-28, amplification factor).
+// freeze every other connection (2026-07-28 outage, amplification factor).
 // The send is non-blocking; a full queue means the connection is stalled or
 // dead, and the error propagates to the caller like any other write failure.
 func (server *Server) Write(webSocketId string, data []byte) error {
@@ -572,7 +572,7 @@ out:
 	// over the slot and the old one is closed. A charger that lost its
 	// previous connection re-dials, and a stale (often already dead) entry
 	// must never lock it out — the previous first-wins policy turned a
-	// fleet-wide reconnect burst into a permanent lockout (sd ocpp-cs
+	// fleet-wide reconnect burst into a permanent lockout (central-system
 	// production incident, 2026-07-28).
 	server.connMutex.Lock()
 	oldWs, exists := server.connections[id]
