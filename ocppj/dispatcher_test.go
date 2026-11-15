@@ -810,13 +810,13 @@ func TestClientDispatcherSendRequestDuringStopDoesNotPanic(t *testing.T) {
 // timeout goroutines must hand the event to the pump without holding the dispatcher's
 // lock, which the pump itself needs to drain them: a server that handles several
 // thousand charge points would otherwise freeze for good after a mass reconnect.
+// Thousands of readers of the client state run alongside, as one per connection does.
 func TestServerDispatcherSurvivesMassTimeout(t *testing.T) {
 	const (
 		clients = 150
+		readers = 3000
 		timeout = 100 * time.Millisecond
 	)
-	endpoint := ocppj.Server{}
-	endpoint.AddProfile(ocpp.NewProfile("mock", &MockFeature{}))
 	// The default pending request state is deliberately kept: it shares the dispatcher's
 	// own lock, as it does in a real server.
 	dispatcher := ocppj.NewDefaultServerDispatcher(ocppj.NewFIFOQueueMap(1))
@@ -824,12 +824,12 @@ func TestServerDispatcherSurvivesMassTimeout(t *testing.T) {
 	var mutex sync.Mutex
 	written := map[string]bool{}
 	networkServer := &MockWebsocketServer{}
+	endpoint := ocppj.NewServer(networkServer, dispatcher, nil, ocpp.NewProfile("mock", &MockFeature{}))
 	networkServer.On("Write", mock.AnythingOfType("string"), mock.Anything).Run(func(args mock.Arguments) {
 		mutex.Lock()
 		defer mutex.Unlock()
 		written[args.String(0)] = true
 	}).Return(nil)
-	dispatcher.SetNetworkServer(networkServer)
 	canceled := make(chan string, clients+1)
 	dispatcher.SetOnRequestCanceled(func(cID string, rID string, request ocpp.Request, err *ocpp.Error) {
 		// A pump that is busy with one timeout while the others queue up is what a
@@ -847,6 +847,27 @@ func TestServerDispatcherSurvivesMassTimeout(t *testing.T) {
 		require.NoError(t, err)
 		return ocppj.RequestBundle{Call: call, Data: data}
 	}
+	// Every incoming message of every charge point looks up its client state. These
+	// readers share the dispatcher's lock and must not hold the pump back.
+	stopReaders := make(chan struct{})
+	defer close(stopReaders)
+	for i := 0; i < readers; i++ {
+		clientID := fmt.Sprintf("silent%d", i%clients)
+		if i%3 == 0 {
+			clientID = fmt.Sprintf("late%d", i) // first use creates the entry
+		}
+		go func() {
+			for {
+				select {
+				case <-stopReaders:
+					return
+				default:
+				}
+				_ = endpoint.RequestState.GetClientState(clientID)
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+	}
 	// Queue a request for every client at once; none of them is ever answered.
 	senders := sync.WaitGroup{}
 	for i := 0; i < clients; i++ {
@@ -859,7 +880,7 @@ func TestServerDispatcherSurvivesMassTimeout(t *testing.T) {
 			_ = dispatcher.SendRequest(clientID, bundle)
 		}()
 	}
-	watchdog := time.After(4 * time.Second)
+	watchdog := time.After(6 * time.Second)
 	// Every request must be canceled by its timeout.
 	for i := 0; i < clients; i++ {
 		select {
@@ -874,6 +895,7 @@ func TestServerDispatcherSurvivesMassTimeout(t *testing.T) {
 		defer close(probe)
 		dispatcher.CreateClient("probe")
 		_ = dispatcher.SendRequest("probe", newBundle())
+		_ = endpoint.RequestState.GetClientState("probe")
 		_ = dispatcher.IsRunning()
 	}()
 	select {
