@@ -25,6 +25,10 @@ import (
 const (
 	// Time allowed to write a message to the peer.
 	defaultWriteWait = 10 * time.Second
+	// Default upper bound for a single incoming message on the server side.
+	// OCPP frames are small JSON documents; without a limit gorilla/websocket
+	// buffers a frame of any size, so one client can exhaust process memory.
+	defaultServerMaxMessageSize = 1 << 20
 	// Time allowed to read the next pong message from the peer.
 	defaultPongWait = 60 * time.Second
 	// Time allowed to wait for a ping on the server, before closing a connection due to inactivity.
@@ -61,13 +65,16 @@ func SetLogger(logger logging.Logger) {
 type ServerTimeoutConfig struct {
 	WriteWait time.Duration
 	PingWait  time.Duration
+	// MaxMessageSize is the maximum size in bytes of a message read from a client.
+	// A larger message closes the connection. Zero or a negative value disables the limit.
+	MaxMessageSize int64
 }
 
 // NewServerTimeoutConfig creates a default timeout configuration for a websocket endpoint.
 //
 // You may change fields arbitrarily and pass the struct to a SetTimeoutConfig method.
 func NewServerTimeoutConfig() ServerTimeoutConfig {
-	return ServerTimeoutConfig{WriteWait: defaultWriteWait, PingWait: defaultPingWait}
+	return ServerTimeoutConfig{WriteWait: defaultWriteWait, PingWait: defaultPingWait, MaxMessageSize: defaultServerMaxMessageSize}
 }
 
 // Config contains optional configuration parameters for a websocket client.
@@ -544,6 +551,9 @@ out:
 		server.error(fmt.Errorf("upgrade failed: %w", err))
 		return
 	}
+	if server.timeoutConfig.MaxMessageSize > 0 {
+		conn.SetReadLimit(server.timeoutConfig.MaxMessageSize)
+	}
 
 	// The id of the charge point is the final path element
 	ws := WebSocket{
@@ -616,7 +626,12 @@ func (server *Server) readPump(ws *WebSocket) {
 
 	conn.SetPingHandler(func(appData string) error {
 		log.Debugf("ping received from %s", ws.ID())
-		ws.pingMessage <- []byte(appData)
+		// Never block the read loop: if a pong is already pending (the client
+		// floods pings, or writePump has exited), drop this one.
+		select {
+		case ws.pingMessage <- []byte(appData):
+		default:
+		}
 		err := conn.SetReadDeadline(server.getReadTimeout())
 		return err
 	})
