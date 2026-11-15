@@ -805,3 +805,93 @@ func TestClientDispatcherSendRequestDuringStopDoesNotPanic(t *testing.T) {
 		<-done
 	}
 }
+
+// Many charge points that never answer make their request timeouts fire together. The
+// timeout goroutines must hand the event to the pump without holding the dispatcher's
+// lock, which the pump itself needs to drain them: a server that handles several
+// thousand charge points would otherwise freeze for good after a mass reconnect.
+func TestServerDispatcherSurvivesMassTimeout(t *testing.T) {
+	const (
+		clients = 150
+		timeout = 100 * time.Millisecond
+	)
+	endpoint := ocppj.Server{}
+	endpoint.AddProfile(ocpp.NewProfile("mock", &MockFeature{}))
+	// The default pending request state is deliberately kept: it shares the dispatcher's
+	// own lock, as it does in a real server.
+	dispatcher := ocppj.NewDefaultServerDispatcher(ocppj.NewFIFOQueueMap(1))
+	dispatcher.SetTimeout(timeout)
+	var mutex sync.Mutex
+	written := map[string]bool{}
+	networkServer := &MockWebsocketServer{}
+	networkServer.On("Write", mock.AnythingOfType("string"), mock.Anything).Run(func(args mock.Arguments) {
+		mutex.Lock()
+		defer mutex.Unlock()
+		written[args.String(0)] = true
+	}).Return(nil)
+	dispatcher.SetNetworkServer(networkServer)
+	canceled := make(chan string, clients+1)
+	dispatcher.SetOnRequestCanceled(func(cID string, rID string, request ocpp.Request, err *ocpp.Error) {
+		// A pump that is busy with one timeout while the others queue up is what a
+		// loaded server looks like; it keeps the timeout channel full.
+		time.Sleep(time.Millisecond)
+		canceled <- cID
+	})
+	dispatcher.Start()
+	// A wedged dispatcher never releases its lock, so cleanup must not wait for it.
+	defer stopDispatcher(dispatcher)
+	newBundle := func() ocppj.RequestBundle {
+		call, err := endpoint.CreateCall(newMockRequest("somevalue"))
+		require.NoError(t, err)
+		data, err := call.MarshalJSON()
+		require.NoError(t, err)
+		return ocppj.RequestBundle{Call: call, Data: data}
+	}
+	// Queue a request for every client at once; none of them is ever answered.
+	senders := sync.WaitGroup{}
+	for i := 0; i < clients; i++ {
+		clientID := fmt.Sprintf("silent%d", i)
+		dispatcher.CreateClient(clientID)
+		bundle := newBundle()
+		senders.Add(1)
+		go func() {
+			defer senders.Done()
+			_ = dispatcher.SendRequest(clientID, bundle)
+		}()
+	}
+	watchdog := time.After(4 * time.Second)
+	// Every request must be canceled by its timeout.
+	for i := 0; i < clients; i++ {
+		select {
+		case <-canceled:
+		case <-watchdog:
+			require.Fail(t, "dispatcher stopped handling timeouts", "only %d of %d requests timed out", i, clients)
+		}
+	}
+	// The dispatcher must still serve new work: a new client and a new request.
+	probe := make(chan struct{})
+	go func() {
+		defer close(probe)
+		dispatcher.CreateClient("probe")
+		_ = dispatcher.SendRequest("probe", newBundle())
+		_ = dispatcher.IsRunning()
+	}()
+	select {
+	case <-probe:
+	case <-watchdog:
+		require.Fail(t, "dispatcher is deadlocked")
+	}
+	for {
+		mutex.Lock()
+		ok := written["probe"]
+		mutex.Unlock()
+		if ok {
+			break
+		}
+		select {
+		case <-watchdog:
+			require.Fail(t, "dispatcher stopped dispatching requests")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
