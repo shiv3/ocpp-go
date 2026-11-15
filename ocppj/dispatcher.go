@@ -283,7 +283,7 @@ func (d *DefaultClientDispatcher) Resume() {
 		d.timer.Reset(d.timeout)
 	} else {
 		// Can dispatch a new request. Notifying message pump.
-		d.readyForDispatch <- true
+		d.signalReadyForDispatch()
 	}
 }
 
@@ -302,7 +302,20 @@ func (d *DefaultClientDispatcher) CompleteRequest(requestId string) {
 	d.pendingRequestState.DeletePendingRequest(requestId)
 	log.Debugf("removed request %v from front of queue", bundle.Call.UniqueId)
 	// Signal that next message in queue may be sent
-	d.readyForDispatch <- true
+	d.signalReadyForDispatch()
+}
+
+// signalReadyForDispatch tells messagePump that the next request may be sent.
+//
+// The flag carries no information beyond "true", so when the buffer already holds one
+// this signal is covered by it and nothing needs to wait. A blocking send would wedge
+// the pump against its own signal when it completes a timed-out or failed request, and
+// would leave a caller blocked for good once the pump has stopped.
+func (d *DefaultClientDispatcher) signalReadyForDispatch() {
+	select {
+	case d.readyForDispatch <- true:
+	default:
+	}
 }
 
 // ServerDispatcher contains the state and logic for handling outgoing messages on a server endpoint.
